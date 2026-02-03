@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Gesture Magic: Particle Confession</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000000;
+            font-family: 'Arial', sans-serif;
+        }
+
+        /* 隐藏视频输入，我们只需要数据 */
+        .input_video {
+            display: none;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: -1;
+        }
+
+        /* 画布全屏 */
+        #output_canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        /* 全屏按钮 */
+        #fullscreen-btn {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 40px;
+            height: 40px;
+            background: rgba(255, 255, 255, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            border-radius: 8px;
+            cursor: pointer;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.3s;
+        }
+
+        #fullscreen-btn:hover {
+            background: rgba(255, 255, 255, 0.4);
+        }
+
+        #fullscreen-btn svg {
+            fill: white;
+            width: 24px;
+            height: 24px;
+        }
+
+        /* 加载提示 - 初始显示，识别开始后隐藏 */
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 14px;
+            pointer-events: none;
+            z-index: 50;
+            text-align: center;
+        }
+        
+        .spinner {
+            width: 30px;
+            height: 30px;
+            border: 3px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+            margin: 0 auto 10px;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+    </style>
+    <!-- 引入 Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- 引入 MediaPipe Hands -->
+    <!-- 添加 defer 属性以确保脚本在解析后执行，虽然在这个环境中我们主要依靠下面的检测逻辑 -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <!-- 视频源 (隐藏) -->
+    <video class="input_video"></video>
+    
+    <!-- 加载状态 -->
+    <div id="loading">
+        <div class="spinner"></div>
+        <div>启动摄像头与AI模型...<br>请允许摄像头权限</div>
+    </div>
+
+    <!-- 全屏按钮 -->
+    <button id="fullscreen-btn" title="全屏模式">
+        <svg viewBox="0 0 24 24">
+            <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>
+        </svg>
+    </button>
+
+    <!-- 3D 容器 -->
+    <div id="canvas-container"></div>
+
+    <!-- 星星 Shader 定义 -->
+    <script type="x-shader/x-vertex" id="star-vertex">
+        attribute float size;
+        attribute float flashSpeed;
+        attribute float flashOffset;
+        
+        varying vec3 vColor;
+        varying float vAlpha;
+        
+        uniform float time;
+        uniform float globalOpacity;
+        
+        void main() {
+            vColor = color;
+            
+            // 计算闪烁：正弦波 + 随机偏移
+            float flash = 0.5 + 0.5 * sin(time * flashSpeed + flashOffset);
+            
+            // 基础大小 * 闪烁因子 * 距离衰减 (透视除法模拟)
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            
+            // 修复：减小星星尺寸乘数，确保不会过大
+            gl_PointSize = size * (0.8 + 0.4 * flash) * (200.0 / -mvPosition.z);
+            gl_Position = projectionMatrix * mvPosition;
+            
+            // 传递透明度到片元着色器
+            vAlpha = globalOpacity * (0.5 + 0.5 * flash);
+        }
+    </script>
+
+    <script type="x-shader/x-fragment" id="star-fragment">
+        uniform sampler2D pointTexture;
+        varying vec3 vColor;
+        varying float vAlpha;
+        
+        void main() {
+            // 获取纹理颜色
+            vec4 texColor = texture2D(pointTexture, gl_PointCoord);
+            
+            // 颜色混合
+            gl_FragColor = vec4(vColor, vAlpha) * texColor;
+            
+            // 简单的 alpha 测试
+            if (gl_FragColor.a < 0.05) discard;
+        }
+    </script>
+
+<script>
+/**
+ * 核心逻辑架构：
+ * 1. Three.js Scene: 负责渲染粒子文字、星辰背景。
+ * 2. MediaPipe Hands: 负责手势识别。
+ * 3. Controller: 将手势映射到视觉效果。
+ */
+
+// --- 1. 全局配置与状态 ---
+const CONFIG = {
+    particleCount: 4500, // 稍微增加粒子数量以适应更大的文字
+    particleSize: 0.18, // 稍微增大粒子
+    textScale: 0.05,
+    colors: {
+        normal: 0x44aaff, // 数字颜色
+        love: 0xFF69B4   // 告白颜色 (亮粉色)
+    }
+};
+
+let state = {
+    currentGesture: -1, // -1: init, 0: fist, 1: one, 2: two, 3: three, 5: love
+    isExploded: false
+};
+
+// --- 2. Three.js 初始化 ---
+const container = document.getElementById('canvas-container');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+// 加上一点雾效，增加深度感
+scene.fog = new THREE.FogExp2(0x000000, 0.02);
+
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+// 修改：拉近镜头，放大画面 (原35 -> 25)
+camera.position.z = 25; 
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+container.appendChild(renderer.domElement);
+
+// 灯光
+const ambientLight = new THREE.AmbientLight(0x404040, 1.5);
+scene.add(ambientLight);
+
+// --- 3. 粒子文字系统 ---
+
+let particles;
+let particleGeometry;
+let particleMaterial;
+let targetPositions = []; // 目标位置数组
+let particleSprite; // 复用贴图
+
+// 创建粒子系统
+function initParticles() {
+    particleGeometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(CONFIG.particleCount * 3);
+    const colors = new Float32Array(CONFIG.particleCount * 3);
+    
+    // 初始位置随机
+    for(let i = 0; i < CONFIG.particleCount; i++) {
+        positions[i*3] = (Math.random() - 0.5) * 50;
+        positions[i*3+1] = (Math.random() - 0.5) * 50;
+        positions[i*3+2] = (Math.random() - 0.5) * 50;
+        
+        colors[i*3] = 1;
+        colors[i*3+1] = 1;
+        colors[i*3+2] = 1;
+    }
+    
+    particleGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    particleGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    // 使用圆形纹理让粒子更好看
+    particleSprite = new THREE.TextureLoader().load('https://threejs.org/examples/textures/sprites/disc.png');
+
+    particleMaterial = new THREE.PointsMaterial({
+        size: CONFIG.particleSize,
+        vertexColors: true,
+        map: particleSprite,
+        transparent: true,
+        alphaTest: 0.5,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false // 关键：关闭深度写入，避免透明排序问题
+    });
+
+    particles = new THREE.Points(particleGeometry, particleMaterial);
+    particles.renderOrder = 999; // 关键：强制渲染在最顶层
+    scene.add(particles);
+}
+
+// 文本转粒子坐标核心函数
+// 修改：增加 subText 参数，支持动态副标题
+function getTextCoordinates(text, subText = "", isLove = false) {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    
+    // 调整画布大小以容纳文字和副标题
+    canvas.width = 500; 
+    canvas.height = 500;
+    
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    
+    if (isLove) {
+        // 告白模式："桐"
+        ctx.fillStyle = '#ffffff'; // 标记为主要部分
+        ctx.font = 'bold 120px Arial';
+        ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+    } else {
+        // 数字模式
+        // 1. 绘制数字 (主要部分，白色)
+        ctx.fillStyle = '#ffffff'; 
+        ctx.font = 'bold 180px Arial';
+        ctx.fillText(text, canvas.width / 2, canvas.height / 2 - 60); // 稍微上移更多，给文字留空间
+        
+        // 2. 绘制副标题 (特殊部分，红色用于标记)
+        // 我们利用红色通道来区分粒子颜色，最终渲染时红色像素对应的粒子将变为粉色
+        if (subText) {
+            ctx.fillStyle = '#ff0000'; 
+            ctx.font = 'bold 60px "Microsoft YaHei", sans-serif'; // 使用中文字体
+            ctx.fillText(subText, canvas.width / 2, canvas.height / 2 + 70); // 下移
+        }
+    }
+    
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+    const coords = [];
+    
+    // 采样像素
+    const step = 2; 
+    for(let y = 0; y < canvas.height; y += step) {
+        for(let x = 0; x < canvas.width; x += step) {
+            const index = (y * canvas.width + x) * 4;
+            const r = data[index];
+            const g = data[index+1];
+            const b = data[index+2];
+            
+            if (r > 50) { // 有像素
+                // 区分类型
+                // 白色 (255,255,255) -> Main (type 0)
+                // 红色 (255,0,0) -> Subtitle (type 1)
+                let type = 0;
+                if (r > 200 && g < 50 && b < 50) {
+                    type = 1;
+                }
+
+                coords.push({
+                    // 修改：放大系数恢复到 2.5，让字更大
+                    x: (x - canvas.width / 2) * CONFIG.textScale * 2.5, 
+                    y: -(y - canvas.height / 2) * CONFIG.textScale * 2.5, 
+                    z: 0,
+                    type: type // 保存类型
+                });
+            }
+        }
+    }
+    return coords;
+}
+
+// 更新目标形态
+// 修改：增加 subText 参数
+function updateTargetFormation(text, subText, type) {
+    let coords = [];
+    let colorHex = CONFIG.colors.normal;
+    let size = CONFIG.particleSize;
+
+    if (text === "") {
+        // 重置状态：粒子随机散开
+        coords = [];
+        for(let i=0; i<CONFIG.particleCount; i++){
+             coords.push({
+                x: (Math.random() - 0.5) * 60,
+                y: (Math.random() - 0.5) * 60,
+                z: (Math.random() - 0.5) * 20
+            });
+        }
+    } else {
+        const isLove = (type === 'love');
+        coords = getTextCoordinates(text, subText, isLove);
+        colorHex = isLove ? CONFIG.colors.love : CONFIG.colors.normal;
+        // 增大告白时的文字粒子
+        size = isLove ? 0.35 : 0.22; 
+    }
+
+    // 更新目标位置数组
+    targetPositions = [];
+    // 填充目标位置
+    for (let i = 0; i < CONFIG.particleCount; i++) {
+        if (i < coords.length) {
+            targetPositions.push(coords[i]);
+        } else {
+            // 多余的粒子让它们飞到屏幕外或隐藏
+             targetPositions.push({
+                x: (Math.random() - 0.5) * 100, 
+                y: (Math.random() - 0.5) * 100, 
+                z: 100 // 远离相机
+            });
+        }
+    }
+
+    // 更新颜色
+    const colorObjMain = new THREE.Color(colorHex);
+    const colorObjSub = new THREE.Color(CONFIG.colors.love); // 副标题固定用粉色
+
+    const colors = particles.geometry.attributes.color.array;
+    for(let i = 0; i < CONFIG.particleCount; i++) {
+        let baseColor = colorObjMain;
+
+        // 如果该粒子分配到了坐标，并且该坐标标记为副标题(type 1)
+        if (i < coords.length && coords[i].type === 1) {
+            baseColor = colorObjSub;
+        }
+
+        // 为颜色添加一点点随机变体，更有质感
+        const variation = Math.random() * 0.2;
+        colors[i*3] = Math.max(0, baseColor.r - variation);
+        colors[i*3+1] = Math.max(0, baseColor.g - variation);
+        colors[i*3+2] = Math.max(0, baseColor.b - variation);
+    }
+    particles.geometry.attributes.color.needsUpdate = true;
+    particleMaterial.size = size;
+}
+
+// --- 4. 升级版：绚丽星辰系统 (Shader Based Starfield) ---
+let starSystem;
+let starUniforms;
+
+// 生成高光晕贴图
+function createGlowTexture() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 64; // 减小尺寸优化性能
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    
+    // 核心亮光
+    let grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0.0, 'rgba(255, 255, 255, 1)');
+    grad.addColorStop(0.2, 'rgba(255, 255, 255, 0.8)');
+    grad.addColorStop(0.5, 'rgba(255, 255, 255, 0.2)');
+    grad.addColorStop(1.0, 'rgba(0, 0, 0, 0)');
+    
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 64);
+    
+    const texture = new THREE.Texture(canvas);
+    texture.needsUpdate = true;
+    return texture;
+}
+
+function initStars() {
+    const starCount = 3000; // 减少数量以提高清晰度
+    const geometry = new THREE.BufferGeometry();
+    
+    const positions = new Float32Array(starCount * 3);
+    const colors = new Float32Array(starCount * 3);
+    const sizes = new Float32Array(starCount);
+    const flashSpeeds = new Float32Array(starCount);
+    const flashOffsets = new Float32Array(starCount);
+    
+    const color = new THREE.Color();
+
+    for(let i = 0; i < starCount; i++) {
+        // 1. 位置分布
+        const r = 20 + Math.random() * 200;
+        const theta = Math.random() * Math.PI * 2;
+        // 深度 Z：将星星推得更远，避免与文字（Z=0）冲突
+        const z = -40 - Math.random() * 150; 
+
+        positions[i*3] = r * Math.cos(theta);
+        positions[i*3+1] = r * Math.sin(theta);
+        positions[i*3+2] = z;
+
+        // 2. 绚丽配色
+        const rand = Math.random();
+        if(rand > 0.9) color.setHex(0xFFFFFF);       // 纯白亮星
+        else if(rand > 0.7) color.setHex(0x00FFFF);  // 青色
+        else if(rand > 0.4) color.setHex(0xFF69B4);  // 亮粉
+        else if(rand > 0.2) color.setHex(0x9370DB);  // 紫色
+        else color.setHex(0xFFD700);                 // 金色
+
+        colors[i*3] = color.r;
+        colors[i*3+1] = color.g;
+        colors[i*3+2] = color.b;
+
+        // 3. 大小与闪烁属性
+        // 修复：大幅减小尺寸基数，从 10-30 减小到 2-6
+        sizes[i] = 2.0 + Math.random() * 4.0; 
+        flashSpeeds[i] = 0.5 + Math.random() * 2.0; 
+        flashOffsets[i] = Math.random() * Math.PI * 2; 
+    }
+    
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+    geometry.setAttribute('flashSpeed', new THREE.BufferAttribute(flashSpeeds, 1));
+    geometry.setAttribute('flashOffset', new THREE.BufferAttribute(flashOffsets, 1));
+
+    // Uniforms
+    starUniforms = {
+        pointTexture: { value: createGlowTexture() },
+        globalOpacity: { value: 0.0 }, // 初始不可见
+        time: { value: 0.0 }
+    };
+
+    // 使用 ShaderMaterial 实现高级效果
+    const material = new THREE.ShaderMaterial({
+        uniforms: starUniforms,
+        vertexShader: document.getElementById('star-vertex').textContent,
+        fragmentShader: document.getElementById('star-fragment').textContent,
+        blending: THREE.AdditiveBlending,
+        depthTest: false, // 禁用深度测试，确保背景不遮挡
+        transparent: true,
+        vertexColors: true
+    });
+
+    starSystem = new THREE.Points(geometry, material);
+    starSystem.renderOrder = -1; // 强制背景层
+    scene.add(starSystem);
+}
+
+function updateStars() {
+    if (!starSystem) return;
+
+    // 更新时间
+    starUniforms.time.value = performance.now() * 0.001;
+
+    // 缓慢旋转星空
+    starSystem.rotation.z += 0.0003;
+
+    // 目标透明度逻辑：
+    // 修改：告白时亮度不降低，透明度直达 1.0 (原0.8)
+    const targetOpacity = state.currentGesture === 5 ? 1.0 : 0.0;
+    
+    // 平滑过渡
+    starUniforms.globalOpacity.value += (targetOpacity - starUniforms.globalOpacity.value) * 0.05;
+}
+
+// --- 5. 动画循环 ---
+function animate() {
+    requestAnimationFrame(animate);
+
+    // 1. 文字粒子动画
+    const positions = particles.geometry.attributes.position.array;
+    if(targetPositions.length > 0) {
+        for(let i = 0; i < CONFIG.particleCount; i++) {
+            if(!targetPositions[i]) continue;
+            
+            const tx = targetPositions[i].x;
+            const ty = targetPositions[i].y;
+            const tz = targetPositions[i].z;
+
+            const cx = positions[i*3];
+            const cy = positions[i*3+1];
+            const cz = positions[i*3+2];
+
+            const lerpFactor = state.currentGesture === 5 ? 0.15 : 0.1;
+
+            positions[i*3] += (tx - cx) * lerpFactor;
+            positions[i*3+1] += (ty - cy) * lerpFactor;
+            positions[i*3+2] += (tz - cz) * lerpFactor;
+        }
+        particles.geometry.attributes.position.needsUpdate = true;
+    }
+
+    // 2. 更新背景星辰
+    updateStars();
+
+    // 粒子整体轻微漂浮感
+    particles.rotation.y = Math.sin(Date.now() * 0.0005) * 0.1;
+
+    renderer.render(scene, camera);
+}
+
+// --- 6. MediaPipe 手势识别逻辑 ---
+
+// 计算手指伸出数量
+function countFingers(landmarks) {
+    let count = 0;
+    
+    const wrist = landmarks[0];
+    
+    // 简单的垂直手指判断 (y轴)
+    const fingers = [8, 12, 16, 20];
+    const pips = [6, 10, 14, 18];
+    
+    fingers.forEach((tipIdx, i) => {
+        if (landmarks[tipIdx].y < landmarks[pips[i]].y) {
+            count++;
+        }
+    });
+
+    // 拇指处理
+    const tip4 = landmarks[4];
+    const ip3 = landmarks[3];
+    const base17 = landmarks[17];
+    
+    const distTip = Math.hypot(tip4.x - base17.x, tip4.y - base17.y);
+    const distIp = Math.hypot(ip3.x - base17.x, ip3.y - base17.y);
+    
+    if (distTip > distIp) {
+        count++;
+    }
+
+    return count;
+}
+
+// 手势处理主逻辑
+function onResults(results) {
+    document.getElementById('loading').style.display = 'none';
+
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const landmarks = results.multiHandLandmarks[0];
+        const fingers = countFingers(landmarks);
+        
+        let newState = -1;
+
+        if (fingers === 0) newState = 0; // 握拳
+        else if (fingers === 1) newState = 1;
+        else if (fingers === 2) newState = 2;
+        else if (fingers === 3) newState = 3;
+        else if (fingers === 5) newState = 5;
+        else newState = state.currentGesture; 
+
+        if (newState !== state.currentGesture) {
+            handleStateChange(newState);
+        }
+    }
+}
+
+function handleStateChange(newState) {
+    console.log(`Switching to state: ${newState}`);
+    state.currentGesture = newState;
+
+    switch(newState) {
+        case 0: // 握拳：重置
+            updateTargetFormation("", "", 'normal');
+            break;
+        case 1:
+            // 修改：1 -> 小桐最棒
+            updateTargetFormation("1", "小桐最棒", 'normal');
+            break;
+        case 2:
+            // 修改：2 -> 小桐最好
+            updateTargetFormation("2", "小桐最好", 'normal');
+            break;
+        case 3:
+            // 修改：3 -> 小桐最美
+            updateTargetFormation("3", "小桐最美", 'normal');
+            break;
+        case 5: // 告白
+            updateTargetFormation("桐", "", 'love');
+            // 星辰会自动渐变出现
+            break;
+    }
+}
+
+// --- 7. 启动与事件监听 ---
+
+let hands;
+let cameraObj;
+
+// 初始化 MediaPipe 逻辑，带重试机制
+function initMediaPipe() {
+    // 检查 Hands 是否已定义
+    if (typeof Hands === 'undefined' || typeof Camera === 'undefined') {
+        console.log("MediaPipe scripts not ready, retrying...");
+        setTimeout(initMediaPipe, 200);
+        return;
+    }
+
+    hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.6
+    });
+
+    hands.onResults(onResults);
+
+    // Camera Setup
+    const videoElement = document.getElementsByClassName('input_video')[0];
+    cameraObj = new Camera(videoElement, {
+        onFrame: async () => {
+            if (hands) await hands.send({image: videoElement});
+        },
+        width: 640,
+        height: 480
+    });
+
+    try {
+        cameraObj.start();
+    } catch (e) {
+        document.getElementById('loading').innerHTML = "摄像头启动失败，请检查权限。";
+    }
+}
+
+// 立即启动视觉循环，不等待 MediaPipe
+initParticles();
+initStars();
+animate();
+
+// 启动 MediaPipe 初始化检查
+initMediaPipe();
+
+// 窗口大小自适应
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// 全屏按钮逻辑 - 修复版 (增加 Promise catch)
+const fsBtn = document.getElementById('fullscreen-btn');
+fsBtn.addEventListener('click', () => {
+    if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(err => {
+            console.warn("Fullscreen request denied:", err);
+        });
+    } else {
+        if (document.exitFullscreen) {
+            document.exitFullscreen().catch(err => {
+                console.warn("Exit fullscreen denied:", err);
+            });
+        }
+    }
+});
+
+</script>
+</body>
+</html>
